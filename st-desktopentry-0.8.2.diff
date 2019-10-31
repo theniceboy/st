@@ -1,0 +1,47 @@
+From d0ffefad4c80f45b689aba7dc64c6d155afcdc16 Mon Sep 17 00:00:00 2001
+From: aleks <aleks.stier@icloud.com>
+Date: Sun, 11 Aug 2019 02:20:42 +0200
+Subject: [PATCH] Create a desktop-entry for st
+
+Creates a desktop-entry for st. This enables to find st in a graphical menu and
+to display it with a nice icon. After applying this patch reinstall st. The
+*st.desktop* file should be automatically copied to */usr/share/applications*
+during install and removed during uninstall.
+---
+ Makefile   | 2 ++
+ st.desktop | 7 +++++++
+ 2 files changed, 9 insertions(+)
+ create mode 100644 st.desktop
+
+diff --git a/Makefile b/Makefile
+index 470ac86..0a58d61 100644
+--- a/Makefile
++++ b/Makefile
+@@ -49,9 +49,11 @@ install: st
+ 	chmod 644 $(DESTDIR)$(MANPREFIX)/man1/st.1
+ 	tic -sx st.info
+ 	@echo Please see the README file regarding the terminfo entry of st.
++	cp -f st.desktop /usr/share/applications
+ 
+ uninstall:
+ 	rm -f $(DESTDIR)$(PREFIX)/bin/st
+ 	rm -f $(DESTDIR)$(MANPREFIX)/man1/st.1
++	rm -f /usr/share/applications/st.desktop
+ 
+ .PHONY: all options clean dist install uninstall
+diff --git a/st.desktop b/st.desktop
+new file mode 100644
+index 0000000..0663e37
+--- /dev/null
++++ b/st.desktop
+@@ -0,0 +1,7 @@
++[Desktop Entry]
++Type=Application
++Name=st
++Comment=simple-terminal emulator for X
++Icon=utilities-terminal
++Exec=st
++Categories=System;TerminalEmulator
+-- 
+2.22.0
+
