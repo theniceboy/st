@@ -1531,11 +1531,17 @@ xdrawcursor(int cx, int cy, Glyph g, int ox, int oy, Glyph og)
 		case 7: /* st extension: snowman (U+2603) */
 			g.u = 0x2603;
 		case 0: /* Blinking Block */
+		  if (IS_SET(MODE_BLINK))
+		  	break;
 		case 1: /* Blinking Block (Default) */
+		  if (IS_SET(MODE_BLINK))
+		  	break;
 		case 2: /* Steady Block */
 			xdrawglyph(g, cx, cy);
 			break;
 		case 3: /* Blinking Underline */
+		  if (IS_SET(MODE_BLINK))
+		  	break;
 		case 4: /* Steady Underline */
 			XftDrawRect(xw.draw, &drawcol,
 					win.hborderpx + cx * win.cw,
@@ -1544,6 +1550,8 @@ xdrawcursor(int cx, int cy, Glyph g, int ox, int oy, Glyph og)
 					win.cw, cursorthickness);
 			break;
 		case 5: /* Blinking bar */
+		  if (IS_SET(MODE_BLINK))
+			break;
 		case 6: /* Steady bar */
 			XftDrawRect(xw.draw, &drawcol,
 					win.hborderpx + cx * win.cw,
@@ -1909,11 +1917,9 @@ run(void)
 		}
 		if (FD_ISSET(ttyfd, &rfd)) {
 			ttyread();
-			if (blinktimeout) {
-				blinkset = tattrset(ATTR_BLINK);
-				if (!blinkset)
-					MODBIT(win.mode, 0, MODE_BLINK);
-			}
+			blinkset = blinktimeout || tattrset(ATTR_BLINK);
+			if (!blinkset)
+			  MODBIT(win.mode, 0, MODE_BLINK);
 		}
 
 		if (FD_ISSET(xfd, &rfd))
@@ -1942,8 +1948,11 @@ run(void)
 				XNextEvent(xw.dpy, &ev);
 				if (XFilterEvent(&ev, None))
 					continue;
-				if (handler[ev.type])
-					(handler[ev.type])(&ev);
+				if (handler[ev.type]) {
+				  	(handler[ev.type])(&ev);
+					lastblink = now;
+					if (IS_SET(MODE_BLINK)) MODBIT(win.mode, 0, MODE_BLINK);
+				}				
 			}
 
 			draw();

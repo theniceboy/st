@@ -6,7 +6,7 @@
  * font: see http://freedesktop.org/software/fontconfig/fontconfig-user.html
  */
 static char *font = "Source Code Pro:pixelsize=24:antialias=true:autohint=true";
-static int borderpx = 0;
+static int borderpx = 4;
 
 /*
  * What program is execed by st depends of these precedence rules:
@@ -49,7 +49,7 @@ static unsigned int actionfps = 30;
  * blinking timeout (set to 0 to disable blinking) for the terminal blinking
  * attribute.
  */
-static unsigned int blinktimeout = 800;
+static unsigned int blinktimeout = 500;
 
 /*
  * thickness of underline and bar cursors
@@ -131,7 +131,9 @@ unsigned int defaultitalic = 7;
 unsigned int defaultunderline = 7;
 /*
  * Default shape of cursor
+ * 1: Blinking Block ("█")
  * 2: Block ("█")
+ * 3: Blinking Underline ("_")
  * 4: Underline ("_")
  * 6: Bar ("|")
  * 7: Snowman ("☃")
