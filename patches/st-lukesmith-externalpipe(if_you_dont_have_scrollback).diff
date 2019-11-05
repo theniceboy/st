@@ -148,3 +148,43 @@ index a1928ca..c2a2b9c 100644
  /* config.h globals */
  extern char *utmp;
  extern char *stty_args;
+diff --git a/Makefile b/Makefile
+index 1b553fb..fa86cac 100644
+--- a/Makefile
++++ b/Makefile
+@@ -43,7 +43,9 @@ dist: clean
+ install: st
+ 	mkdir -p $(DESTDIR)$(PREFIX)/bin
+ 	cp -f st $(DESTDIR)$(PREFIX)/bin
++	cp -f st-copyout $(DESTDIR)$(PREFIX)/bin
+ 	chmod 755 $(DESTDIR)$(PREFIX)/bin/st
++	chmod 755 $(DESTDIR)$(PREFIX)/bin/st-copyout
+ 	mkdir -p $(DESTDIR)$(MANPREFIX)/man1
+ 	sed "s/VERSION/$(VERSION)/g" < st.1 > $(DESTDIR)$(MANPREFIX)/man1/st.1
+ 	chmod 644 $(DESTDIR)$(MANPREFIX)/man1/st.1
+@@ -53,6 +55,7 @@ install: st
+ 
+ uninstall:
+ 	rm -f $(DESTDIR)$(PREFIX)/bin/st
++	rm -f $(DESTDIR)$(PREFIX)/bin/st-copyout
+ 	rm -f $(DESTDIR)$(MANPREFIX)/man1/st.1
+ 	rm -f /usr/share/applications/st.desktop
+ 
+diff --git a/st-copyout b/st-copyout
+new file mode 100644
+index 0000000..8eafc58
+--- /dev/null
++++ b/st-copyout
+@@ -0,0 +1,12 @@
++#!/bin/sh
++# Using external pipe with st, give a dmenu prompt of recent commands,
++# allowing the user to copy the output of one.
++# xclip required for this script.
++# By Jaywalker and Luke
++tmpfile=$(mktemp /tmp/st-cmd-output.XXXXXX)
++trap 'rm "$tmpfile"' 0 1 15
++sed -n "w $tmpfile"
++ps1="$(grep "\S" "$tmpfile" | tail -n 1 | sed 's/^\s*//' | cut -d' ' -f1)"
++chosen="$(grep -F "$ps1" "$tmpfile" | sed '$ d' | tac | dmenu -p "Copy which command's output?" -i -l 10 | sed 's/[^^]/[&]/g; s/\^/\\^/g')"
++eps1="$(echo "$ps1" | sed 's/[^^]/[&]/g; s/\^/\\^/g')"
++awk "/^$chosen$/{p=1;print;next} p&&/$eps1/{p=0};p" "$tmpfile" | xclip -selection clipboard
