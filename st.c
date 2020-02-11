@@ -1,8 +1,10 @@
 /* See LICENSE for license details. */
+#include <assert.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <pwd.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -17,8 +19,10 @@
 #include <unistd.h>
 #include <wchar.h>
 
+
 #include "st.h"
 #include "win.h"
+#include "dynamicArray.h"
 
 #if   defined(__linux)
  #include <pty.h>
@@ -104,16 +108,18 @@ typedef struct {
 	int mode;
 	int type;
 	int snap;
-	/*
-	 * Selection variables:
-	 * nb – normalized coordinates of the beginning of the selection
-	 * ne – normalized coordinates of the end of the selection
-	 * ob – original coordinates of the beginning of the selection
-	 * oe – original coordinates of the end of the selection
-	 */
+	/// Selection variables:
+	/// ob – original coordinates of the beginning of the selection
+	/// oe – original coordinates of the end of the selection
+	struct {
+		int x, y, scroll;
+	} ob, oe;
+	/// Selection variables; currently displayed chunk.
+	/// nb – normalized coordinates of the beginning of the selection
+	/// ne – normalized coordinates of the end of the selection
 	struct {
 		int x, y;
-	} nb, ne, ob, oe;
+	} nb, ne;
 
 	int alt;
 } Selection;
@@ -161,6 +167,50 @@ typedef struct {
 	char *args[STR_ARG_SIZ];
 	int narg;              /* nb of args */
 } STREscape;
+
+/// Position (x, y , and current scroll in the y dimension).
+typedef struct Position {
+	uint32_t x;
+	uint32_t y;
+	uint32_t yScr;
+} Position;
+
+/// The entire normal mode state, consisting of an operation
+/// and a motion.
+struct NormalModeState {
+	Position initialPosition;
+	// Operation:
+	struct OperationState {
+		enum Operation {
+			noop,
+			visual,
+			visualLine,
+			yank
+		} op;
+		Position startPosition;
+	} command;
+	// Motions:
+	struct MotionState {
+		uint32_t amount;
+		enum Search {
+			none,
+			forward,
+			backward,
+		} search;
+		Position searchPosition;
+		bool finished;
+	} motion;
+} stateNormalMode;
+
+
+DynamicArray searchString =  UTF8_ARRAY;
+DynamicArray commandHist0 =  UTF8_ARRAY;
+DynamicArray commandHist1 =  UTF8_ARRAY;
+DynamicArray highlights   = QWORD_ARRAY;
+/// History command toggle
+bool toggle = false;
+#define currentCommand toggle ? &commandHist0 : &commandHist1
+#define lastCommand    toggle ? &commandHist1 : &commandHist0
 
 static void execsh(char *, char **);
 static void stty(char **);
@@ -242,6 +292,12 @@ static uchar utfbyte[UTF_SIZ + 1] = {0x80,    0, 0xC0, 0xE0, 0xF0};
 static uchar utfmask[UTF_SIZ + 1] = {0xC0, 0x80, 0xE0, 0xF0, 0xF8};
 static Rune utfmin[UTF_SIZ + 1] = {       0,    0,  0x80,  0x800,  0x10000};
 static Rune utfmax[UTF_SIZ + 1] = {0x10FFFF, 0x7F, 0x7FF, 0xFFFF, 0x10FFFF};
+
+void applyPosition(Position const *pos) {
+	term.c.x = pos->x;
+	term.c.y = pos->y;
+	term.scr = pos->yScr;
+}
 
 ssize_t
 xwrite(int fd, const char *s, size_t len)
@@ -431,7 +487,13 @@ tlinelen(int y)
 }
 
 void
-selstart(int col, int row, int snap)
+xselstart(int col, int row, int snap) {
+	selstart(col, row, term.scr, snap);
+}
+
+
+void
+selstart(int col, int row, int scroll, int snap)
 {
 	selclear();
 	sel.mode = SEL_EMPTY;
@@ -440,6 +502,7 @@ selstart(int col, int row, int snap)
 	sel.snap = snap;
 	sel.oe.x = sel.ob.x = col;
 	sel.oe.y = sel.ob.y = row;
+	sel.oe.scroll = sel.ob.scroll = scroll;
 	selnormalize();
 
 	if (sel.snap != 0)
@@ -448,10 +511,13 @@ selstart(int col, int row, int snap)
 }
 
 void
-selextend(int col, int row, int type, int done)
-{
-	int oldey, oldex, oldsby, oldsey, oldtype;
+xselextend(int col, int row, int type, int done) {
+	selextend(col, row, term.scr, type, done);
+}
 
+void
+selextend(int col, int row, int scroll, int type, int done)
+{
 	if (sel.mode == SEL_IDLE)
 		return;
 	if (done && sel.mode == SEL_EMPTY) {
@@ -459,18 +525,22 @@ selextend(int col, int row, int type, int done)
 		return;
 	}
 
-	oldey = sel.oe.y;
-	oldex = sel.oe.x;
-	oldsby = sel.nb.y;
-	oldsey = sel.ne.y;
-	oldtype = sel.type;
+	int const oldey = sel.oe.y;
+	int const oldex = sel.oe.x;
+	int const oldscroll = sel.oe.scroll;
+	int const oldsby = sel.nb.y;
+	int const oldsey = sel.ne.y;
+	int const oldtype = sel.type;
 
 	sel.oe.x = col;
 	sel.oe.y = row;
+	sel.oe.scroll = scroll;
+
 	selnormalize();
 	sel.type = type;
 
-	if (oldey != sel.oe.y || oldex != sel.oe.x || oldtype != sel.type || sel.mode == SEL_EMPTY)
+	if (oldey != sel.oe.y || oldex != sel.oe.x || oldscroll != sel.oe.scroll
+			|| oldtype != sel.type || sel.mode == SEL_EMPTY)
 		tsetdirt(MIN(sel.nb.y, oldsby), MAX(sel.ne.y, oldsey));
 
 	sel.mode = done ? SEL_IDLE : SEL_READY;
@@ -479,17 +549,21 @@ selextend(int col, int row, int type, int done)
 void
 selnormalize(void)
 {
-	int i;
-
-	if (sel.type == SEL_REGULAR && sel.ob.y != sel.oe.y) {
-		sel.nb.x = sel.ob.y < sel.oe.y ? sel.ob.x : sel.oe.x;
-		sel.ne.x = sel.ob.y < sel.oe.y ? sel.oe.x : sel.ob.x;
+	sel.nb.y = INTERVAL(sel.ob.y + term.scr - sel.ob.scroll, 0, term.bot);
+	sel.ne.y = INTERVAL(sel.oe.y + term.scr - sel.oe.scroll, 0, term.bot);
+	if (sel.type == SEL_REGULAR && sel.nb.y != sel.ne.y) {
+		sel.nb.x = sel.nb.y < sel.ne.y ? sel.ob.x : sel.oe.x;
+		sel.ne.x = sel.nb.y < sel.ne.y ? sel.oe.x : sel.ob.x;
 	} else {
 		sel.nb.x = MIN(sel.ob.x, sel.oe.x);
 		sel.ne.x = MAX(sel.ob.x, sel.oe.x);
 	}
-	sel.nb.y = MIN(sel.ob.y, sel.oe.y);
-	sel.ne.y = MAX(sel.ob.y, sel.oe.y);
+
+	if (sel.nb.y > sel.ne.y) {
+		int32_t const tmp = sel.nb.y;
+		sel.nb.y = sel.ne.y;
+		sel.ne.y = tmp;
+	}
 
 	selsnap(&sel.nb.x, &sel.nb.y, -1);
 	selsnap(&sel.ne.x, &sel.ne.y, +1);
@@ -497,7 +571,7 @@ selnormalize(void)
 	/* expand selection over line breaks */
 	if (sel.type == SEL_RECTANGULAR)
 		return;
-	i = tlinelen(sel.nb.y);
+	int i = tlinelen(sel.nb.y);
 	if (i < sel.nb.x)
 		sel.nb.x = i;
 	if (tlinelen(sel.ne.y) <= sel.ne.x)
@@ -603,11 +677,19 @@ getsel(void)
 	if (sel.ob.x == -1)
 		return NULL;
 
-	bufsize = (term.col+1) * (sel.ne.y-sel.nb.y+1) * UTF_SIZ;
+	int32_t syb = sel.ob.y - sel.ob.scroll + term.scr;
+	int32_t sye = sel.oe.y - sel.oe.scroll + term.scr;
+	if (syb > sye) {
+		int32_t tmp = sye;
+		sye = syb;
+		syb = tmp;
+	}
+
+	bufsize = (term.col+1) * (sye - syb + 1) * UTF_SIZ;
 	ptr = str = xmalloc(bufsize);
 
 	/* append every set & selected glyph to the selection */
-	for (y = sel.nb.y; y <= sel.ne.y; y++) {
+	for (y = syb; y <= sye; y++) {
 		if ((linelen = tlinelen(y)) == 0) {
 			*ptr++ = '\n';
 			continue;
@@ -617,8 +699,8 @@ getsel(void)
 			gp = &TLINE(y)[sel.nb.x];
 			lastx = sel.ne.x;
 		} else {
-			gp = &TLINE(y)[sel.nb.y == y ? sel.nb.x : 0];
-			lastx = (sel.ne.y == y) ? sel.ne.x : term.col-1;
+			gp = &TLINE(y)[syb == y ? sel.nb.x : 0];
+			lastx = (sye == y) ? sel.ne.x : term.col-1;
 		}
 		last = &TLINE(y)[MIN(lastx, linelen-1)];
 		while (last >= gp && last->u == ' ')
@@ -844,6 +926,8 @@ ttywrite(const char *s, size_t n, int may_echo)
 {
 	const char *next;
 	Arg arg = (Arg) { .i = term.scr };
+
+	kscrolldown(&arg);
 
 	kscrolldown(&arg);
 
@@ -1153,6 +1237,7 @@ selscroll(int orig, int n)
 		return;
 
 	if (BETWEEN(sel.ob.y, orig, term.bot) || BETWEEN(sel.oe.y, orig, term.bot)) {
+		sel.oe.scroll = sel.ob.scroll = term.scr;
 		if ((sel.ob.y += n) > term.bot || (sel.oe.y += n) < term.top) {
 			selclear();
 			return;
@@ -1187,6 +1272,537 @@ tnewline(int first_col)
 		y++;
 	}
 	tmoveto(first_col ? 0 : term.c.x, y);
+}
+
+int
+currentLine(int x, int y)
+{
+	return (x == term.c.x || y == term.c.y);
+}
+
+int
+highlighted(int x, int y)
+{
+	// Compute the legal bounds for a hit:
+	int32_t const stringSize = size(&searchString);
+	int32_t xMin = x - stringSize;
+	int32_t yMin = y;
+	while (xMin < 0 && yMin > 0) { //< I think this temds to be more efficient than
+		xMin += term.col;            //  division + modulo.
+		--yMin;
+	}
+	if (xMin < 0) { xMin = 0; }
+
+	uint32_t highSize = size(&highlights);
+	uint32_t *ptr = (uint32_t*) highlights.content;
+	for (uint32_t i = 0; i < highSize; ++i) {
+		int32_t const sx = *(ptr++);
+		int32_t const sy = *(ptr++);
+		if (BETWEEN(sy, yMin, y) && (sy != yMin || sx > xMin) && (sy != y || sx <= x)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+int mod(int a, int b) {
+	while (a < 0) {
+		a+= b;
+	}
+	return a % b;
+}
+
+void displayString(DynamicArray const *str, Glyph *g, int yPos) {
+	// Threshold: if there is nothing or no space to print, do not print.
+	if (term.col == 0 || str->index == 0) {
+		term.dirty[yPos] = 1; //< mark this line as 'dirty', because the line is not
+		//  marked dirty when scrolling due to string display.
+		return;
+	}
+
+	uint32_t lineSize = MIN(size(str), term.col / 3);
+	uint32_t xEnd = term.col - 1;
+	assert(lineSize <= 1 + xEnd); //< as lineSize <= term.col/3 <= term.col - 1 + 1 = xEnd + 1
+	uint32_t xStart = 1 + xEnd - lineSize;
+
+	Line line = malloc(sizeof(Glyph) * lineSize);
+	assert(str->index - 1 >=  lineSize - 1); //< lineSize <= str->index -1 direct premise.
+
+	for (uint32_t lineIdx = 0; lineIdx < lineSize; lineIdx++) {
+		line[lineIdx] = *g;
+		char* end = viewEnd(str, lineSize - lineIdx - 1);
+		memcpy(&line[lineIdx].u, end, str->itemSize);
+	}
+	xdrawline(TLINE(yPos), 0, yPos, xStart);
+	xdrawline(line -xStart, xStart, yPos, xEnd+1);
+	free(line); // that sucks.
+}
+
+/// Print either the current command or the last comman din case the current command is empty.
+void printCommandString() {
+	Glyph g = {'c', ATTR_ITALIC | ATTR_FAINT , defaultfg, defaultbg};
+	if (term.c.y == term.row-1) { g.mode ^= ATTR_CURRENT; } //< dont highlight
+	DynamicArray * cc = currentCommand;
+	displayString(isEmpty(cc) ? lastCommand : cc, &g, term.row - 1);
+	//displayString(lastCommand, &g, term.row - 2);
+}
+
+void printSearchString() {
+	Glyph g = {'c', ATTR_ITALIC | ATTR_BOLD_FAINT, defaultfg, defaultbg};
+	if (term.c.y == term.row-2) { g.mode ^= ATTR_CURRENT; } //< dont highlight
+	displayString(&searchString, &g, term.row - 2);
+}
+
+/// Default state if no operation is performed.
+struct NormalModeState defaultNormalMode = {{0,0,0}, {noop, {0, 0, 0}}, {0, none, {0, 0, 0}, false}};
+
+void enableMode(enum Operation o) {
+	stateNormalMode.command.op = o;
+	stateNormalMode.command.startPosition.x = term.c.x;
+	stateNormalMode.command.startPosition.y = term.c.y;
+	stateNormalMode.command.startPosition.yScr = term.scr;
+}
+
+bool normalModeEnabled = false;
+
+void onNormalModeStart() {
+	normalModeEnabled = true;
+}
+
+void onNormalModeStop() { //XXX breaks if resized
+	normalModeEnabled = false;
+	applyPosition(&stateNormalMode.initialPosition);
+}
+
+void moveLine(int8_t sign) {
+	if (sign == -1) {
+		if (term.c.y-- == 0) {
+			if (++term.scr == HISTSIZE) {
+				term.c.y = term.row - 1;
+				term.scr = 0;
+			} else {
+				term.c.y = 0;
+			}
+		}
+	} else {
+		term.c.x = 0;
+		if (++term.c.y == term.row) {
+			if (term.scr-- == 0) {
+				term.c.y = 0;
+				term.scr = HISTSIZE - 1;
+			} else {
+				term.c.y = term.row - 1;
+			}
+		}
+	}
+}
+
+void moveLetter(int8_t sign) {
+	term.c.x += sign;
+	if (!BETWEEN(term.c.x, 0, term.col-1)) {
+		if (term.c.x < 0) {
+			term.c.x = term.col - 1;
+			moveLine(sign);
+		} else {
+			term.c.x = 0;
+			moveLine(sign);
+		}
+	}
+}
+
+bool contains (char ksym, char const * values, uint32_t amount) {
+	for (uint32_t i = 0; i < amount; i++) { if (ksym == values[i]) { return true; } }
+	return false;
+}
+
+
+void terminateCommand(bool abort) {
+	stateNormalMode.command = defaultNormalMode.command; //< clear command + motion
+	stateNormalMode.motion  = defaultNormalMode.motion;
+	selclear();                                          //< clear selection if any
+
+	if (!abort) { toggle = !toggle; }
+	empty(currentCommand);
+
+	printCommandString();
+	printSearchString();
+	//tsetdirt(0, term.row-3);
+}
+inline void exitCommand() { terminateCommand(false); }
+inline void abortCommand() { terminateCommand(true); }
+
+/// Go to next occurrence of string relative to the current location
+/// conduct search, starting at start pos
+bool
+gotoString(int8_t sign) {
+	uint32_t findIndex = 0;
+	uint32_t searchStringSize = size(&searchString);
+	uint32_t const maxIteration = (HISTSIZE + term.row) * term.col + searchStringSize;  //< one complete traversal.
+	for (uint32_t cIteration = 0; findIndex < searchStringSize
+			&& cIteration ++ < maxIteration; moveLetter(sign)) {
+		uint32_t const searchChar = *((uint32_t*)(sign == 1 ? view(&searchString, findIndex)
+					: viewEnd(&searchString, findIndex)));
+
+		uint32_t const fu = TLINE(term.c.y)[term.c.x].u;
+
+		if (fu == searchChar) findIndex++;
+		else findIndex = 0;
+	}
+	bool const found = findIndex == searchStringSize;
+	if (found) { for (uint32_t i = 0; i < searchStringSize; i++) { moveLetter(-sign); } }
+	return found;
+}
+
+/// Find the next occurrence of a word
+bool
+gotoNextString(int8_t sign) {
+	moveLetter(sign);
+	return gotoString(sign);
+}
+
+/// Highlight all found strings on the current screen.
+void
+highlightStringOnScreen() {
+	if (isEmpty(&searchString)) { return; }
+	uint32_t const searchStringSize = size(&searchString);
+	uint32_t findIndex = 0;
+	uint32_t xStart, yStart;
+	for (uint32_t y = 0; y < term.row; y++) {
+		for (uint32_t x = 0; x < term.col; x++) {
+			if (TLINE(y)[x].u == *((uint32_t*)(view(&searchString, findIndex)))) {
+				if (findIndex++ == 0) {
+					xStart = x;
+					yStart = y;
+				}
+				if (findIndex == searchStringSize) {
+					// mark selected
+					append(&highlights, &xStart);
+					append(&highlights, &yStart);
+
+					findIndex = 0;
+					term.dirty[yStart] = 1;
+				}
+			} else {
+				findIndex = 0;
+			}
+		}
+	}
+}
+
+void gotoStringAndHighlight(int8_t sign) {
+	bool const found = gotoString(sign);  //< find the next string to the current position
+	empty(&highlights);             //< remove previous highlights
+	if (found) {                          //< apply new highlights if found
+		//if (sign == -1) { moveLetter(-1); }
+		highlightStringOnScreen(sign);
+	} else {                              //< go to the position where the search started.
+		applyPosition(&stateNormalMode.motion.searchPosition);
+	}
+	tsetdirt(0, term.row-3);              //< repaint everything except for the status bar, which
+	                                      //  is painted separately.
+}
+
+void pressKeys(char const* nullTerminatedString) {
+	size_t end;
+	for (size_t i = 0, end=strlen(nullTerminatedString); i < end; ++i) {
+		if (nullTerminatedString[i] == '\n') {
+			kpressNormalMode(&nullTerminatedString[i], 0, false, true, false);
+		} else {
+			kpressNormalMode(&nullTerminatedString[i], 1, false, false, false);
+		}
+	}
+}
+
+void executeCommand(DynamicArray const *command) {
+	size_t end;
+	char decoded [32];
+	for (size_t i = 0, end=size(command); i < end; ++i) {
+		size_t len = utf8encode(*((Rune*)view(command, i)) , decoded);
+		kpressNormalMode(decoded, len, false, false, false);
+	}
+	//kpressNormalMode(NULL, 0, false, true, false);
+}
+
+void kpressNormalMode(char const * ksym, uint32_t len, bool esc, bool enter, bool backspace) {
+	// [ESC] or [ENTER] abort resp. finish the current operation or
+	// the Normal Mode if no operation is currently executed.
+	if (esc || enter) {
+		if (stateNormalMode.command.op == noop
+				&& stateNormalMode.motion.search == none
+				&& stateNormalMode.motion.amount == 0) {
+			terminateCommand(!enter);
+			empty(&highlights);
+			tfulldirt(); // < this also removes the search string and the last command.
+			normalMode(NULL);
+		} else {
+			if (enter && stateNormalMode.motion.search != none && !isEmpty(&searchString)) {
+				exitCommand(); //stateNormalMode.motion.finished = true;
+				return;
+			} else {
+				abortCommand();
+			}
+		}
+		return;
+	} //< ! (esc || enter)
+	// Search: append to search string & conduct search for best hit, starting at start pos,
+	//         highlighting all other occurrences on the current page if one is found.
+	if (stateNormalMode.motion.search != none && !stateNormalMode.motion.finished) {
+		int8_t const sign = stateNormalMode.motion.search == forward ? 1 : -1;
+		// Apply start position.
+		if (backspace) { // XXX: if a quantifier is subject to removal, it is currently only removed
+			               //      from the  command string.
+			if (!isEmpty(currentCommand) && !isEmpty(&searchString)) {
+				pop(currentCommand);
+				pop(&searchString);
+			} else if (isEmpty(currentCommand) || isEmpty(&searchString)) {
+				empty(&highlights);
+				stateNormalMode.motion = defaultNormalMode .motion; //< if typed once more than there are
+				selclear();                                         //  letters, the search motion is
+				return;                                             //  terminated
+			}
+			applyPosition(&stateNormalMode.motion.searchPosition);
+		} else {
+			if (len > 0) {
+				char* kSearch = checkGetNext(&searchString);
+				utf8decode(ksym, (Rune*)(kSearch), len);
+
+				char* kCommand = checkGetNext(currentCommand);
+				utf8decode(ksym, (Rune*)(kCommand), len);
+			}
+		}
+		if (sign == -1) { moveLetter(1); }
+		gotoStringAndHighlight(sign); //< go to the next occurrence of the string and highlight
+		                              //  all occurrences currently on screen
+
+		if (stateNormalMode.command.op == visual) {
+			selextend(term.c.x, term.c.y, term.scr, sel.type, 0);
+		} else if  (stateNormalMode.command.op == visualLine) {
+			selextend(term.col-1, term.c.y, term.scr, sel.type, 0);
+		}
+		printCommandString();
+		printSearchString();
+		return;
+	}
+
+	if (len == 0) { return; }
+	// V / v or y take precedence over movement commands.
+	switch(ksym[0]) {
+		case '.':
+			{
+
+				if (!isEmpty(currentCommand)) { toggle = !toggle; empty(currentCommand); }
+				executeCommand(lastCommand);
+			}
+			return;
+		case 'y': //< Yank mode
+			{
+				char* kCommand = checkGetNext(currentCommand);
+				utf8decode(ksym, (Rune*)(kCommand), len);
+				switch(stateNormalMode.command.op) {
+					case noop:           //< Start yank mode & set #op
+						enableMode(yank);
+						selstart(term.c.x, term.c.y, term.scr, 0);
+						empty(currentCommand);
+						break;
+					case visualLine:     //< Complete yank operation
+					case visual:
+						xsetsel(getsel());     //< yank
+						xclipcopy();
+						exitCommand();         //< reset command
+						break;
+					case yank:           //< Complete yank operation as in y#amount j
+						selstart(0, term.c.y, term.scr, 0);
+						uint32_t const origY = term.c.y;
+						for (int32_t i = 0; i < MAX(stateNormalMode.motion.amount, 1) - 1; i ++) moveLine(1);
+						selextend(term.col-1, term.c.y, term.scr, SEL_RECTANGULAR, 0);
+						xsetsel(getsel());
+						xclipcopy();
+						term.c.y = origY;
+						exitCommand();
+				}
+			}
+			printCommandString();
+			printSearchString();
+			return;
+		case 'v':                //< Visual Mode: Toggle mode.
+		case 'V':
+			{
+				enum Operation mode = ksym[0] == 'v' ? visual : visualLine;
+				bool assign = stateNormalMode.command.op != mode;
+				abortCommand();
+				if (assign) {
+					enableMode(mode);
+					char* kCommand = checkGetNext(currentCommand);
+					utf8decode(ksym, (Rune*)(kCommand), len);
+					if (mode == visualLine) {
+						selstart(0, term.c.y, term.scr, 0);
+						selextend(term.col-1, term.c.y, term.scr, SEL_RECTANGULAR, 0);
+					} else {
+						selstart(term.c.x, term.c.y, term.scr, 0);
+					}
+				}
+			}
+			return;
+	}
+	// Perform the movement.
+	int32_t sign = -1;    //< whehter a command goes 'forward' (1) or 'backward' (-1)
+	bool discard = false; //< discard input, as it does not have a meaning.
+	switch(ksym[0]) {
+		case 'e': sign = 1;
+		case 'u':
+							term.c.y += sign * MAX(stateNormalMode.motion.amount, 1);
+							break;
+		case 'H': term.c.y = 0;            break; //< [numer]H ~ L[number]j is not supported.
+		case 'M': term.c.y = term.bot / 2; break;
+		case 'L': term.c.y = term.bot;     break; //< [numer]L ~ L[number]k is not supported.
+		case 'G':  //< a little different from vim, but in this use case the most useful translation.
+							applyPosition(&stateNormalMode.initialPosition);
+		case 'i': sign = 1;
+		case 'n':
+							{
+								int32_t const amount = term.c.x + sign * MAX(stateNormalMode.motion.amount, 1);
+								term.c.x = amount % term.col;
+								while (term.c.x < 0) { term.c.x += term.col; }
+								term.c.y += floor(1.0 * amount / term.col);
+								break;
+							}
+		case 'N':
+							if (stateNormalMode.motion.amount == 0) { term.c.x = 0; }
+							else { discard = true; }
+							break;
+		case 'I': term.c.x = term.col-1; break;
+		case 'w':
+		case 'W':
+		case 'h':
+		case 'E': sign = 1;
+		case 'B':
+		case 'b':
+							{
+								bool const startSpaceIsSeparator = !(ksym[0] == 'w' || ksym[0] == 'W');
+								bool const capital = ksym[0] <= 90; //< defines the word separators to use
+								char const * const wDelim = capital ? wordDelimLarge : wordDelimSmall;
+								uint32_t const wDelimLen =  strlen(wDelim);
+								bool const performOffset = startSpaceIsSeparator; //< start & end with offset.
+								uint32_t const maxIteration = (HISTSIZE + term.row) * term.col;  //< one complete traversal.
+
+								// doesn't work exactly as in vim, but I think this version is better;
+								// Linebreak is counted as 'normal' separator; hence a jump can span multiple lines here.
+								stateNormalMode.motion.amount = MAX(stateNormalMode.motion.amount, 1);
+								for (; stateNormalMode.motion.amount > 0; stateNormalMode.motion.amount--) {
+									uint8_t state = 0;
+									if (performOffset) { moveLetter(sign); }
+									for (uint32_t cIteration = 0; cIteration ++ < maxIteration; moveLetter(sign)) {
+										if (startSpaceIsSeparator == contains(TLINE(term.c.y)[term.c.x].u, wDelim, wDelimLen)) {
+											if (state == 1) {
+												if (performOffset) { moveLetter(-sign); }
+												break;
+											}
+										} else if (state == 0) { state = 1; }
+									}
+								}
+								break;
+							}
+		case '/': sign = 1;
+		case '?':
+							empty(&searchString);
+							stateNormalMode.motion.search = sign == 1 ? forward : backward;
+							stateNormalMode.motion.searchPosition.x = term.c.x;
+							stateNormalMode.motion.searchPosition.y = term.c.y;
+							stateNormalMode.motion.searchPosition.yScr = term.scr;
+							stateNormalMode.motion.finished = false;
+							break;
+		case '-': sign = 1;
+		case '=':
+							toggle = !toggle;
+							empty(currentCommand);
+							if (stateNormalMode.motion.search == none) {
+								stateNormalMode.motion.search = forward;
+								stateNormalMode.motion.finished = true;
+							}
+							for (int32_t amount = MAX(stateNormalMode.motion.amount, 1); amount > 0; amount--) {
+								if (stateNormalMode.motion.search == backward) { sign *= -1; }
+								moveLetter(sign);
+								gotoStringAndHighlight(sign);
+							}
+							break;
+		case 't':
+							if (sel.type == SEL_REGULAR) {
+								sel.type = SEL_RECTANGULAR;
+							} else {
+								sel.type = SEL_REGULAR;
+							}
+							tsetdirt(sel.nb.y, sel.ne.y);
+							discard = true;
+		default:
+							discard = true;
+	}
+	bool const isNumber = len == 1 && BETWEEN(ksym[0], 48, 57);
+	if (isNumber) { //< record numbers
+		discard = false;
+		stateNormalMode.motion.amount =
+			MIN(SHRT_MAX, stateNormalMode.motion.amount * 10 + ksym[0] - 48);
+	} else if (!discard) {
+		stateNormalMode.motion.amount = 0;
+	}
+
+	if (discard) {
+		for (size_t i = 0; i < amountNormalModeShortcuts; ++i) {
+			if (ksym[0] == normalModeShortcuts[i].key) {
+				pressKeys(normalModeShortcuts[i].value);
+			}
+		}
+	} else {
+		char* kCommand = checkGetNext(currentCommand);
+		utf8decode(ksym, (Rune*)(kCommand), len);
+
+		int diff = 0;
+		if (term.c.y > 0) {
+			if (term.c.y > term.bot) {
+				diff = term.bot - term.c.y;
+				term.c.y = term.bot;
+			}
+		} else {
+			if (term.c.y < 0) {
+				diff = -term.c.y;
+				term.c.y = 0;
+			}
+		}
+
+		int const _newScr = term.scr + diff;
+		term.c.y = _newScr < 0 ? 0 : (_newScr >= HISTSIZE ? term.bot : term.c.y);
+		term.scr = mod(_newScr, HISTSIZE);
+
+		if (!isEmpty(&highlights)) {
+			empty(&highlights);
+			highlightStringOnScreen();
+		}
+
+		tsetdirt(0, term.row-3);
+		printCommandString();
+		printSearchString();
+
+		if (stateNormalMode.command.op == visual) {
+			selextend(term.c.x, term.c.y, term.scr, sel.type, 0);
+		} else if  (stateNormalMode.command.op == visualLine) {
+			selextend(term.col-1, term.c.y, term.scr, sel.type, 0);
+		} else {
+			if (!isNumber && (stateNormalMode.motion.search == none
+					|| stateNormalMode.motion.finished)) {
+				toggle = !toggle;
+				empty(currentCommand);
+			}
+			if (stateNormalMode.command.op == yank) {
+				if (!isNumber && !discard) {
+					// copy
+					selextend(term.c.x, term.c.y, term.scr, sel.mode, 0);
+					xsetsel(getsel());
+					xclipcopy();
+					applyPosition(&stateNormalMode.command.startPosition);
+					exitCommand();
+				}
+			}
+		}
+	}
 }
 
 void
@@ -1241,6 +1857,10 @@ tmoveto(int x, int y)
 	term.c.state &= ~CURSOR_WRAPNEXT;
 	term.c.x = LIMIT(x, 0, term.col-1);
 	term.c.y = LIMIT(y, miny, maxy);
+	// Set the last position in order to restore after normal mode exits.
+	stateNormalMode.initialPosition.x = term.c.x;
+	stateNormalMode.initialPosition.y = term.c.y;
+	stateNormalMode.initialPosition.yScr = term.scr;
 }
 
 void
@@ -2640,6 +3260,14 @@ tresize(int col, int row)
 		}
 	}
 
+	for (i = 0; i < HISTSIZE; i++) {
+		term.hist[i] = xrealloc(term.hist[i], col * sizeof(Glyph));
+		for (j = mincol; j < col; j++) {
+			term.hist[i][j] = term.c.attr;
+			term.hist[i][j].u = ' ';
+		}
+	}
+
 	/* resize each row to new width, zero-pad if needed */
 	for (i = 0; i < minrow; i++) {
 		term.line[i] = xrealloc(term.line[i], col * sizeof(Glyph));
@@ -2719,8 +3347,8 @@ draw(void)
 
 	drawregion(0, 0, term.col, term.row);
 	if (term.scr == 0)
-		xdrawcursor(cx, term.c.y, term.line[term.c.y][cx],
-				term.ocx, term.ocy, term.line[term.ocy][term.ocx]);
+		xdrawcursor(cx, term.c.y, TLINE(term.c.y)[cx],
+				term.ocx, term.ocy, TLINE(term.ocy)[term.ocx]);
 	term.ocx = cx, term.ocy = term.c.y;
 	xfinishdraw();
 	xximspot(term.ocx, term.ocy);
