@@ -19,7 +19,6 @@ enum win_mode {
 	MODE_MOUSEMANY   = 1 << 15,
 	MODE_BRCKTPASTE  = 1 << 16,
 	MODE_NUMLOCK     = 1 << 17,
-	MODE_NORMAL      = 1 << 18,
 	MODE_MOUSE       = MODE_MOUSEBTN|MODE_MOUSEMOTION|MODE_MOUSEX10\
 	                  |MODE_MOUSEMANY,
 };
@@ -28,7 +27,6 @@ void xbell(void);
 void xclipcopy(void);
 void xdrawcursor(int, int, Glyph, int, int, Glyph);
 void xdrawline(Line, int, int, int);
-void xdrawglyph(Glyph, int, int);
 void xfinishdraw(void);
 void xloadcols(void);
 int xsetcolorname(int, const char *);

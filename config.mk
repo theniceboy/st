@@ -1,5 +1,5 @@
 # st version
-VERSION = 0.8.2
+VERSION = 0.8.3
 
 # Customize below to fit your system
 
@@ -16,7 +16,7 @@ PKG_CONFIG = pkg-config
 INCS = -I$(X11INC) \
        `$(PKG_CONFIG) --cflags fontconfig` \
        `$(PKG_CONFIG) --cflags freetype2`
-LIBS = -L$(X11LIB) -lm -lrt -lX11 -lutil -lXft -lXrender\
+LIBS = -L$(X11LIB) -lm -lrt -lX11 -lutil -lXft \
        `$(PKG_CONFIG) --libs fontconfig` \
        `$(PKG_CONFIG) --libs freetype2`
 

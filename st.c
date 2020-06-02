@@ -1,10 +1,8 @@
 /* See LICENSE for license details. */
-#include <assert.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <math.h>
 #include <pwd.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -19,10 +17,8 @@
 #include <unistd.h>
 #include <wchar.h>
 
-
 #include "st.h"
 #include "win.h"
-#include "dynamicArray.h"
 
 #if   defined(__linux)
  #include <pty.h>
@@ -39,20 +35,13 @@
 #define ESC_ARG_SIZ   16
 #define STR_BUF_SIZ   ESC_BUF_SIZ
 #define STR_ARG_SIZ   ESC_ARG_SIZ
-#define HISTSIZE      2000
 
 /* macros */
 #define IS_SET(flag)		((term.mode & (flag)) != 0)
-#define ISCONTROLC0(c)		(BETWEEN(c, 0, 0x1f) || (c) == '\177')
+#define ISCONTROLC0(c)		(BETWEEN(c, 0, 0x1f) || (c) == 0x7f)
 #define ISCONTROLC1(c)		(BETWEEN(c, 0x80, 0x9f))
 #define ISCONTROL(c)		(ISCONTROLC0(c) || ISCONTROLC1(c))
 #define ISDELIM(u)		(u && wcschr(worddelimiters, u))
-#define TLINE(y)		((y) < term.scr ? term.hist[((y) + term.histi - \
-				term.scr + HISTSIZE + 1) % HISTSIZE] : \
-				term.line[(y) - term.scr])
-
-// from @LukeSmithxyz
-#define TLINE_HIST(y)           ((y) <= HISTSIZE-term.row+2 ? term.hist[(y)] : term.line[(y-HISTSIZE+term.row-3)])
 
 enum term_mode {
 	MODE_WRAP        = 1 << 0,
@@ -108,18 +97,16 @@ typedef struct {
 	int mode;
 	int type;
 	int snap;
-	/// Selection variables:
-	/// ob – original coordinates of the beginning of the selection
-	/// oe – original coordinates of the end of the selection
-	struct {
-		int x, y, scroll;
-	} ob, oe;
-	/// Selection variables; currently displayed chunk.
-	/// nb – normalized coordinates of the beginning of the selection
-	/// ne – normalized coordinates of the end of the selection
+	/*
+	 * Selection variables:
+	 * nb – normalized coordinates of the beginning of the selection
+	 * ne – normalized coordinates of the end of the selection
+	 * ob – original coordinates of the beginning of the selection
+	 * oe – original coordinates of the end of the selection
+	 */
 	struct {
 		int x, y;
-	} nb, ne;
+	} nb, ne, ob, oe;
 
 	int alt;
 } Selection;
@@ -130,9 +117,6 @@ typedef struct {
 	int col;      /* nb col */
 	Line *line;   /* screen */
 	Line *alt;    /* alternate screen */
-	Line hist[HISTSIZE]; /* history buffer */
-	int histi;    /* history index */
-	int scr;      /* scroll back */
 	int *dirty;   /* dirtyness of lines */
 	TCursor c;    /* cursor */
 	int ocx;      /* old cursor col */
@@ -145,13 +129,14 @@ typedef struct {
 	int charset;  /* current charset */
 	int icharset; /* selected charset for sequence */
 	int *tabs;
+	Rune lastc;   /* last printed char outside of sequence, 0 if control */
 } Term;
 
 /* CSI Escape sequence structs */
 /* ESC '[' [[ [<priv>] <arg> [;]] <mode> [<mode>]] */
 typedef struct {
 	char buf[ESC_BUF_SIZ]; /* raw string */
-	int len;               /* raw string length */
+	size_t len;            /* raw string length */
 	char priv;
 	int arg[ESC_ARG_SIZ];
 	int narg;              /* nb of args */
@@ -162,55 +147,12 @@ typedef struct {
 /* ESC type [[ [<priv>] <arg> [;]] <mode>] ESC '\' */
 typedef struct {
 	char type;             /* ESC type ... */
-	char buf[STR_BUF_SIZ]; /* raw string */
-	int len;               /* raw string length */
+	char *buf;             /* allocated raw string */
+	size_t siz;            /* allocation size */
+	size_t len;            /* raw string length */
 	char *args[STR_ARG_SIZ];
 	int narg;              /* nb of args */
 } STREscape;
-
-/// Position (x, y , and current scroll in the y dimension).
-typedef struct Position {
-	uint32_t x;
-	uint32_t y;
-	uint32_t yScr;
-} Position;
-
-/// The entire normal mode state, consisting of an operation
-/// and a motion.
-struct NormalModeState {
-	Position initialPosition;
-	// Operation:
-	struct OperationState {
-		enum Operation {
-			noop,
-			visual,
-			visualLine,
-			yank
-		} op;
-		Position startPosition;
-	} command;
-	// Motions:
-	struct MotionState {
-		uint32_t amount;
-		enum Search {
-			none,
-			forward,
-			backward,
-		} search;
-		Position searchPosition;
-		bool finished;
-	} motion;
-} stateNormalMode;
-
-
-DynamicArray searchString =  UTF8_ARRAY;
-DynamicArray commandHist0 =  UTF8_ARRAY;
-DynamicArray commandHist1 =  UTF8_ARRAY;
-DynamicArray highlights   = QWORD_ARRAY;
-/// History command toggle
-bool toggle = false;
-#define currentCommand toggle ? &commandHist0 : &commandHist1
-#define lastCommand    toggle ? &commandHist1 : &commandHist0
 
 static void execsh(char *, char **);
 static void stty(char **);
@@ -244,8 +186,8 @@ static void tnewline(int);
 static void tputtab(int);
 static void tputc(Rune);
 static void treset(void);
-static void tscrollup(int, int, int);
-static void tscrolldown(int, int, int);
+static void tscrollup(int, int);
+static void tscrolldown(int, int);
 static void tsetattr(int *, int);
 static void tsetchar(Rune, Glyph *, int, int);
 static void tsetdirt(int, int);
@@ -260,8 +202,6 @@ static void tdefutf8(char);
 static int32_t tdefcolor(int *, int *, int);
 static void tdeftran(char);
 static void tstrsequence(uchar);
-static void tsetcolor(int, int, int, uint32_t, uint32_t);
-static char * findlastany(char *, const char**, size_t);
 
 static void drawregion(int, int, int, int);
 
@@ -292,12 +232,6 @@ static uchar utfbyte[UTF_SIZ + 1] = {0x80,    0, 0xC0, 0xE0, 0xF0};
 static uchar utfmask[UTF_SIZ + 1] = {0xC0, 0x80, 0xE0, 0xF0, 0xF8};
 static Rune utfmin[UTF_SIZ + 1] = {       0,    0,  0x80,  0x800,  0x10000};
 static Rune utfmax[UTF_SIZ + 1] = {0x10FFFF, 0x7F, 0x7FF, 0xFFFF, 0x10FFFF};
-
-void applyPosition(Position const *pos) {
-	term.c.x = pos->x;
-	term.c.y = pos->y;
-	term.scr = pos->yScr;
-}
 
 ssize_t
 xwrite(int fd, const char *s, size_t len)
@@ -433,8 +367,9 @@ static const char base64_digits[] = {
 char
 base64dec_getc(const char **src)
 {
-	while (**src && !isprint(**src)) (*src)++;
-	return *((*src)++);
+	while (**src && !isprint(**src))
+		(*src)++;
+	return **src ? *((*src)++) : '=';  /* emulate padding if string ends */
 }
 
 char *
@@ -451,6 +386,10 @@ base64dec(const char *src)
 		int b = base64_digits[(unsigned char) base64dec_getc(&src)];
 		int c = base64_digits[(unsigned char) base64dec_getc(&src)];
 		int d = base64_digits[(unsigned char) base64dec_getc(&src)];
+
+		/* invalid input. 'a' can be -1, e.g. if src is "\n" (c-str) */
+		if (a == -1 || b == -1)
+			break;
 
 		*dst++ = (a << 2) | ((b & 0x30) >> 4);
 		if (c == -1)
@@ -477,23 +416,17 @@ tlinelen(int y)
 {
 	int i = term.col;
 
-	if (TLINE(y)[i - 1].mode & ATTR_WRAP)
+	if (term.line[y][i - 1].mode & ATTR_WRAP)
 		return i;
 
-	while (i > 0 && TLINE(y)[i - 1].u == ' ')
+	while (i > 0 && term.line[y][i - 1].u == ' ')
 		--i;
 
 	return i;
 }
 
 void
-xselstart(int col, int row, int snap) {
-	selstart(col, row, term.scr, snap);
-}
-
-
-void
-selstart(int col, int row, int scroll, int snap)
+selstart(int col, int row, int snap)
 {
 	selclear();
 	sel.mode = SEL_EMPTY;
@@ -502,7 +435,6 @@ selstart(int col, int row, int scroll, int snap)
 	sel.snap = snap;
 	sel.oe.x = sel.ob.x = col;
 	sel.oe.y = sel.ob.y = row;
-	sel.oe.scroll = sel.ob.scroll = scroll;
 	selnormalize();
 
 	if (sel.snap != 0)
@@ -511,13 +443,10 @@ selstart(int col, int row, int scroll, int snap)
 }
 
 void
-xselextend(int col, int row, int type, int done) {
-	selextend(col, row, term.scr, type, done);
-}
-
-void
-selextend(int col, int row, int scroll, int type, int done)
+selextend(int col, int row, int type, int done)
 {
+	int oldey, oldex, oldsby, oldsey, oldtype;
+
 	if (sel.mode == SEL_IDLE)
 		return;
 	if (done && sel.mode == SEL_EMPTY) {
@@ -525,22 +454,18 @@ selextend(int col, int row, int scroll, int type, int done)
 		return;
 	}
 
-	int const oldey = sel.oe.y;
-	int const oldex = sel.oe.x;
-	int const oldscroll = sel.oe.scroll;
-	int const oldsby = sel.nb.y;
-	int const oldsey = sel.ne.y;
-	int const oldtype = sel.type;
+	oldey = sel.oe.y;
+	oldex = sel.oe.x;
+	oldsby = sel.nb.y;
+	oldsey = sel.ne.y;
+	oldtype = sel.type;
 
 	sel.oe.x = col;
 	sel.oe.y = row;
-	sel.oe.scroll = scroll;
-
 	selnormalize();
 	sel.type = type;
 
-	if (oldey != sel.oe.y || oldex != sel.oe.x || oldscroll != sel.oe.scroll
-			|| oldtype != sel.type || sel.mode == SEL_EMPTY)
+	if (oldey != sel.oe.y || oldex != sel.oe.x || oldtype != sel.type || sel.mode == SEL_EMPTY)
 		tsetdirt(MIN(sel.nb.y, oldsby), MAX(sel.ne.y, oldsey));
 
 	sel.mode = done ? SEL_IDLE : SEL_READY;
@@ -549,21 +474,17 @@ selextend(int col, int row, int scroll, int type, int done)
 void
 selnormalize(void)
 {
-	sel.nb.y = INTERVAL(sel.ob.y + term.scr - sel.ob.scroll, 0, term.bot);
-	sel.ne.y = INTERVAL(sel.oe.y + term.scr - sel.oe.scroll, 0, term.bot);
-	if (sel.type == SEL_REGULAR && sel.nb.y != sel.ne.y) {
-		sel.nb.x = sel.nb.y < sel.ne.y ? sel.ob.x : sel.oe.x;
-		sel.ne.x = sel.nb.y < sel.ne.y ? sel.oe.x : sel.ob.x;
+	int i;
+
+	if (sel.type == SEL_REGULAR && sel.ob.y != sel.oe.y) {
+		sel.nb.x = sel.ob.y < sel.oe.y ? sel.ob.x : sel.oe.x;
+		sel.ne.x = sel.ob.y < sel.oe.y ? sel.oe.x : sel.ob.x;
 	} else {
 		sel.nb.x = MIN(sel.ob.x, sel.oe.x);
 		sel.ne.x = MAX(sel.ob.x, sel.oe.x);
 	}
-
-	if (sel.nb.y > sel.ne.y) {
-		int32_t const tmp = sel.nb.y;
-		sel.nb.y = sel.ne.y;
-		sel.ne.y = tmp;
-	}
+	sel.nb.y = MIN(sel.ob.y, sel.oe.y);
+	sel.ne.y = MAX(sel.ob.y, sel.oe.y);
 
 	selsnap(&sel.nb.x, &sel.nb.y, -1);
 	selsnap(&sel.ne.x, &sel.ne.y, +1);
@@ -571,7 +492,7 @@ selnormalize(void)
 	/* expand selection over line breaks */
 	if (sel.type == SEL_RECTANGULAR)
 		return;
-	int i = tlinelen(sel.nb.y);
+	i = tlinelen(sel.nb.y);
 	if (i < sel.nb.x)
 		sel.nb.x = i;
 	if (tlinelen(sel.ne.y) <= sel.ne.x)
@@ -607,7 +528,7 @@ selsnap(int *x, int *y, int direction)
 		 * Snap around if the word wraps around at the end or
 		 * beginning of a line.
 		 */
-		prevgp = &TLINE(*y)[*x];
+		prevgp = &term.line[*y][*x];
 		prevdelim = ISDELIM(prevgp->u);
 		for (;;) {
 			newx = *x + direction;
@@ -622,14 +543,14 @@ selsnap(int *x, int *y, int direction)
 					yt = *y, xt = *x;
 				else
 					yt = newy, xt = newx;
-				if (!(TLINE(yt)[xt].mode & ATTR_WRAP))
+				if (!(term.line[yt][xt].mode & ATTR_WRAP))
 					break;
 			}
 
 			if (newx >= tlinelen(newy))
 				break;
 
-			gp = &TLINE(newy)[newx];
+			gp = &term.line[newy][newx];
 			delim = ISDELIM(gp->u);
 			if (!(gp->mode & ATTR_WDUMMY) && (delim != prevdelim
 					|| (delim && gp->u != prevgp->u)))
@@ -650,14 +571,14 @@ selsnap(int *x, int *y, int direction)
 		*x = (direction < 0) ? 0 : term.col - 1;
 		if (direction < 0) {
 			for (; *y > 0; *y += direction) {
-				if (!(TLINE(*y-1)[term.col-1].mode
+				if (!(term.line[*y-1][term.col-1].mode
 						& ATTR_WRAP)) {
 					break;
 				}
 			}
 		} else if (direction > 0) {
 			for (; *y < term.row-1; *y += direction) {
-				if (!(TLINE(*y)[term.col-1].mode
+				if (!(term.line[*y][term.col-1].mode
 						& ATTR_WRAP)) {
 					break;
 				}
@@ -677,32 +598,24 @@ getsel(void)
 	if (sel.ob.x == -1)
 		return NULL;
 
-	int32_t syb = sel.ob.y - sel.ob.scroll + term.scr;
-	int32_t sye = sel.oe.y - sel.oe.scroll + term.scr;
-	if (syb > sye) {
-		int32_t tmp = sye;
-		sye = syb;
-		syb = tmp;
-	}
-
-	bufsize = (term.col+1) * (sye - syb + 1) * UTF_SIZ;
+	bufsize = (term.col+1) * (sel.ne.y-sel.nb.y+1) * UTF_SIZ;
 	ptr = str = xmalloc(bufsize);
 
 	/* append every set & selected glyph to the selection */
-	for (y = syb; y <= sye; y++) {
+	for (y = sel.nb.y; y <= sel.ne.y; y++) {
 		if ((linelen = tlinelen(y)) == 0) {
 			*ptr++ = '\n';
 			continue;
 		}
 
 		if (sel.type == SEL_RECTANGULAR) {
-			gp = &TLINE(y)[sel.nb.x];
+			gp = &term.line[y][sel.nb.x];
 			lastx = sel.ne.x;
 		} else {
-			gp = &TLINE(y)[syb == y ? sel.nb.x : 0];
-			lastx = (sye == y) ? sel.ne.x : term.col-1;
+			gp = &term.line[y][sel.nb.y == y ? sel.nb.x : 0];
+			lastx = (sel.ne.y == y) ? sel.ne.x : term.col-1;
 		}
-		last = &TLINE(y)[MIN(lastx, linelen-1)];
+		last = &term.line[y][MIN(lastx, linelen-1)];
 		while (last >= gp && last->u == ' ')
 			--last;
 
@@ -722,7 +635,8 @@ getsel(void)
 		 * st.
 		 * FIXME: Fix the computer world.
 		 */
-		if ((y < sel.ne.y || lastx >= linelen) && !(last->mode & ATTR_WRAP))
+		if ((y < sel.ne.y || lastx >= linelen) &&
+		    (!(last->mode & ATTR_WRAP) || sel.type == SEL_RECTANGULAR))
 			*ptr++ = '\n';
 	}
 	*ptr = 0;
@@ -753,7 +667,7 @@ die(const char *errstr, ...)
 void
 execsh(char *cmd, char **args)
 {
-	char *sh, *prog;
+	char *sh, *prog, *arg;
 	const struct passwd *pw;
 
 	errno = 0;
@@ -767,13 +681,20 @@ execsh(char *cmd, char **args)
 	if ((sh = getenv("SHELL")) == NULL)
 		sh = (pw->pw_shell[0]) ? pw->pw_shell : cmd;
 
-	if (args)
+	if (args) {
 		prog = args[0];
-	else if (utmp)
+		arg = NULL;
+	} else if (scroll) {
+		prog = scroll;
+		arg = utmp ? utmp : sh;
+	} else if (utmp) {
 		prog = utmp;
-	else
+		arg = NULL;
+	} else {
 		prog = sh;
-	DEFAULT(args, ((char *[]) {prog, NULL}));
+		arg = NULL;
+	}
+	DEFAULT(args, ((char *[]) {prog, arg, NULL}));
 
 	unsetenv("COLUMNS");
 	unsetenv("LINES");
@@ -811,7 +732,7 @@ sigchld(int a)
 		die("child exited with status %d\n", WEXITSTATUS(stat));
 	else if (WIFSIGNALED(stat))
 		die("child terminated due to signal %d\n", WTERMSIG(stat));
-	exit(0);
+	_exit(0);
 }
 
 void
@@ -904,32 +825,31 @@ ttyread(void)
 {
 	static char buf[BUFSIZ];
 	static int buflen = 0;
-	int written;
-	int ret;
+	int ret, written;
 
 	/* append read bytes to unprocessed bytes */
-	if ((ret = read(cmdfd, buf+buflen, LEN(buf)-buflen)) < 0)
+	ret = read(cmdfd, buf+buflen, LEN(buf)-buflen);
+
+	switch (ret) {
+	case 0:
+		exit(0);
+	case -1:
 		die("couldn't read from shell: %s\n", strerror(errno));
-	buflen += ret;
-
-	written = twrite(buf, buflen, 0);
-	buflen -= written;
-	/* keep any uncomplete utf8 char for the next call */
-	if (buflen > 0)
-		memmove(buf, buf + written, buflen);
-
-	return ret;
+	default:
+		buflen += ret;
+		written = twrite(buf, buflen, 0);
+		buflen -= written;
+		/* keep any incomplete UTF-8 byte sequence for the next call */
+		if (buflen > 0)
+			memmove(buf, buf + written, buflen);
+		return ret;
+	}
 }
 
 void
 ttywrite(const char *s, size_t n, int may_echo)
 {
 	const char *next;
-	Arg arg = (Arg) { .i = term.scr };
-
-	kscrolldown(&arg);
-
-	kscrolldown(&arg);
 
 	if (may_echo && IS_SET(MODE_ECHO))
 		twrite(s, n, 1);
@@ -1141,52 +1061,12 @@ tswapscreen(void)
 }
 
 void
-kscrolldown(const Arg* a)
-{
-	int n = a->i;
-
-	if (n < 0)
-		n = term.row + n;
-
-	if (n > term.scr)
-		n = term.scr;
-
-	if (term.scr > 0) {
-		term.scr -= n;
-		selscroll(0, -n);
-		tfulldirt();
-	}
-}
-
-void
-kscrollup(const Arg* a)
-{
-	int n = a->i;
-
-	if (n < 0)
-		n = term.row + n;
-
-	if (term.scr <= HISTSIZE-n) {
-		term.scr += n;
-		selscroll(0, n);
-		tfulldirt();
-	}
-}
-
-void
-tscrolldown(int orig, int n, int copyhist)
+tscrolldown(int orig, int n)
 {
 	int i;
 	Line temp;
 
 	LIMIT(n, 0, term.bot-orig+1);
-
-	if (copyhist) {
-		term.histi = (term.histi - 1 + HISTSIZE) % HISTSIZE;
-		temp = term.hist[term.histi];
-		term.hist[term.histi] = term.line[term.bot];
-		term.line[term.bot] = temp;
-	}
 
 	tsetdirt(orig, term.bot-n);
 	tclearregion(0, term.bot-n+1, term.col-1, term.bot);
@@ -1201,22 +1081,12 @@ tscrolldown(int orig, int n, int copyhist)
 }
 
 void
-tscrollup(int orig, int n, int copyhist)
+tscrollup(int orig, int n)
 {
 	int i;
 	Line temp;
 
 	LIMIT(n, 0, term.bot-orig+1);
-
-	if (copyhist) {
-		term.histi = (term.histi + 1) % HISTSIZE;
-		temp = term.hist[term.histi];
-		term.hist[term.histi] = term.line[orig];
-		term.line[orig] = temp;
-	}
-
-	if (term.scr > 0 && term.scr < HISTSIZE)
-		term.scr = MIN(term.scr + n, HISTSIZE-1);
 
 	tclearregion(0, orig, term.col-1, orig+n-1);
 	tsetdirt(orig+n, term.bot);
@@ -1236,28 +1106,17 @@ selscroll(int orig, int n)
 	if (sel.ob.x == -1)
 		return;
 
-	if (BETWEEN(sel.ob.y, orig, term.bot) || BETWEEN(sel.oe.y, orig, term.bot)) {
-		sel.oe.scroll = sel.ob.scroll = term.scr;
-		if ((sel.ob.y += n) > term.bot || (sel.oe.y += n) < term.top) {
+	if (BETWEEN(sel.nb.y, orig, term.bot) != BETWEEN(sel.ne.y, orig, term.bot)) {
+		selclear();
+	} else if (BETWEEN(sel.nb.y, orig, term.bot)) {
+		sel.ob.y += n;
+		sel.oe.y += n;
+		if (sel.ob.y < term.top || sel.ob.y > term.bot ||
+		    sel.oe.y < term.top || sel.oe.y > term.bot) {
 			selclear();
-			return;
-		}
-		if (sel.type == SEL_RECTANGULAR) {
-			if (sel.ob.y < term.top)
-				sel.ob.y = term.top;
-			if (sel.oe.y > term.bot)
-				sel.oe.y = term.bot;
 		} else {
-			if (sel.ob.y < term.top) {
-				sel.ob.y = term.top;
-				sel.ob.x = 0;
-			}
-			if (sel.oe.y > term.bot) {
-				sel.oe.y = term.bot;
-				sel.oe.x = term.col;
-			}
+			selnormalize();
 		}
-		selnormalize();
 	}
 }
 
@@ -1267,542 +1126,11 @@ tnewline(int first_col)
 	int y = term.c.y;
 
 	if (y == term.bot) {
-		tscrollup(term.top, 1, 1);
+		tscrollup(term.top, 1);
 	} else {
 		y++;
 	}
 	tmoveto(first_col ? 0 : term.c.x, y);
-}
-
-int
-currentLine(int x, int y)
-{
-	return (x == term.c.x || y == term.c.y);
-}
-
-int
-highlighted(int x, int y)
-{
-	// Compute the legal bounds for a hit:
-	int32_t const stringSize = size(&searchString);
-	int32_t xMin = x - stringSize;
-	int32_t yMin = y;
-	while (xMin < 0 && yMin > 0) { //< I think this temds to be more efficient than
-		xMin += term.col;            //  division + modulo.
-		--yMin;
-	}
-	if (xMin < 0) { xMin = 0; }
-
-	uint32_t highSize = size(&highlights);
-	uint32_t *ptr = (uint32_t*) highlights.content;
-	for (uint32_t i = 0; i < highSize; ++i) {
-		int32_t const sx = *(ptr++);
-		int32_t const sy = *(ptr++);
-		if (BETWEEN(sy, yMin, y) && (sy != yMin || sx > xMin) && (sy != y || sx <= x)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-int mod(int a, int b) {
-	while (a < 0) {
-		a+= b;
-	}
-	return a % b;
-}
-
-void displayString(DynamicArray const *str, Glyph *g, int yPos) {
-	// Threshold: if there is nothing or no space to print, do not print.
-	if (term.col == 0 || str->index == 0) {
-		term.dirty[yPos] = 1; //< mark this line as 'dirty', because the line is not
-		//  marked dirty when scrolling due to string display.
-		return;
-	}
-
-	uint32_t lineSize = MIN(size(str), term.col / 3);
-	uint32_t xEnd = term.col - 1;
-	assert(lineSize <= 1 + xEnd); //< as lineSize <= term.col/3 <= term.col - 1 + 1 = xEnd + 1
-	uint32_t xStart = 1 + xEnd - lineSize;
-
-	Line line = malloc(sizeof(Glyph) * lineSize);
-	assert(str->index - 1 >=  lineSize - 1); //< lineSize <= str->index -1 direct premise.
-
-	for (uint32_t lineIdx = 0; lineIdx < lineSize; lineIdx++) {
-		line[lineIdx] = *g;
-		char* end = viewEnd(str, lineSize - lineIdx - 1);
-		memcpy(&line[lineIdx].u, end, str->itemSize);
-	}
-	xdrawline(TLINE(yPos), 0, yPos, xStart);
-	xdrawline(line -xStart, xStart, yPos, xEnd+1);
-	free(line); // that sucks.
-}
-
-/// Print either the current command or the last comman din case the current command is empty.
-void printCommandString() {
-	Glyph g = {'c', ATTR_ITALIC | ATTR_FAINT , defaultfg, defaultbg};
-	if (term.c.y == term.row-1) { g.mode ^= ATTR_CURRENT; } //< dont highlight
-	DynamicArray * cc = currentCommand;
-	displayString(isEmpty(cc) ? lastCommand : cc, &g, term.row - 1);
-	//displayString(lastCommand, &g, term.row - 2);
-}
-
-void printSearchString() {
-	Glyph g = {'c', ATTR_ITALIC | ATTR_BOLD_FAINT, defaultfg, defaultbg};
-	if (term.c.y == term.row-2) { g.mode ^= ATTR_CURRENT; } //< dont highlight
-	displayString(&searchString, &g, term.row - 2);
-}
-
-/// Default state if no operation is performed.
-struct NormalModeState defaultNormalMode = {{0,0,0}, {noop, {0, 0, 0}}, {0, none, {0, 0, 0}, false}};
-
-void enableMode(enum Operation o) {
-	stateNormalMode.command.op = o;
-	stateNormalMode.command.startPosition.x = term.c.x;
-	stateNormalMode.command.startPosition.y = term.c.y;
-	stateNormalMode.command.startPosition.yScr = term.scr;
-}
-
-bool normalModeEnabled = false;
-
-void onNormalModeStart() {
-	normalModeEnabled = true;
-}
-
-void onNormalModeStop() { //XXX breaks if resized
-	normalModeEnabled = false;
-	applyPosition(&stateNormalMode.initialPosition);
-}
-
-void moveLine(int8_t sign) {
-	if (sign == -1) {
-		if (term.c.y-- == 0) {
-			if (++term.scr == HISTSIZE) {
-				term.c.y = term.row - 1;
-				term.scr = 0;
-			} else {
-				term.c.y = 0;
-			}
-		}
-	} else {
-		term.c.x = 0;
-		if (++term.c.y == term.row) {
-			if (term.scr-- == 0) {
-				term.c.y = 0;
-				term.scr = HISTSIZE - 1;
-			} else {
-				term.c.y = term.row - 1;
-			}
-		}
-	}
-}
-
-void moveLetter(int8_t sign) {
-	term.c.x += sign;
-	if (!BETWEEN(term.c.x, 0, term.col-1)) {
-		if (term.c.x < 0) {
-			term.c.x = term.col - 1;
-			moveLine(sign);
-		} else {
-			term.c.x = 0;
-			moveLine(sign);
-		}
-	}
-}
-
-bool contains (char ksym, char const * values, uint32_t amount) {
-	for (uint32_t i = 0; i < amount; i++) { if (ksym == values[i]) { return true; } }
-	return false;
-}
-
-
-void terminateCommand(bool abort) {
-	stateNormalMode.command = defaultNormalMode.command; //< clear command + motion
-	stateNormalMode.motion  = defaultNormalMode.motion;
-	selclear();                                          //< clear selection if any
-
-	if (!abort) { toggle = !toggle; }
-	empty(currentCommand);
-
-	printCommandString();
-	printSearchString();
-	//tsetdirt(0, term.row-3);
-}
-inline void exitCommand() { terminateCommand(false); }
-inline void abortCommand() { terminateCommand(true); }
-
-/// Go to next occurrence of string relative to the current location
-/// conduct search, starting at start pos
-bool
-gotoString(int8_t sign) {
-	uint32_t findIndex = 0;
-	uint32_t searchStringSize = size(&searchString);
-	uint32_t const maxIteration = (HISTSIZE + term.row) * term.col + searchStringSize;  //< one complete traversal.
-	for (uint32_t cIteration = 0; findIndex < searchStringSize
-			&& cIteration ++ < maxIteration; moveLetter(sign)) {
-		uint32_t const searchChar = *((uint32_t*)(sign == 1 ? view(&searchString, findIndex)
-					: viewEnd(&searchString, findIndex)));
-
-		uint32_t const fu = TLINE(term.c.y)[term.c.x].u;
-
-		if (fu == searchChar) findIndex++;
-		else findIndex = 0;
-	}
-	bool const found = findIndex == searchStringSize;
-	if (found) { for (uint32_t i = 0; i < searchStringSize; i++) { moveLetter(-sign); } }
-	return found;
-}
-
-/// Find the next occurrence of a word
-bool
-gotoNextString(int8_t sign) {
-	moveLetter(sign);
-	return gotoString(sign);
-}
-
-/// Highlight all found strings on the current screen.
-void
-highlightStringOnScreen() {
-	if (isEmpty(&searchString)) { return; }
-	uint32_t const searchStringSize = size(&searchString);
-	uint32_t findIndex = 0;
-	uint32_t xStart, yStart;
-	for (uint32_t y = 0; y < term.row; y++) {
-		for (uint32_t x = 0; x < term.col; x++) {
-			if (TLINE(y)[x].u == *((uint32_t*)(view(&searchString, findIndex)))) {
-				if (findIndex++ == 0) {
-					xStart = x;
-					yStart = y;
-				}
-				if (findIndex == searchStringSize) {
-					// mark selected
-					append(&highlights, &xStart);
-					append(&highlights, &yStart);
-
-					findIndex = 0;
-					term.dirty[yStart] = 1;
-				}
-			} else {
-				findIndex = 0;
-			}
-		}
-	}
-}
-
-void gotoStringAndHighlight(int8_t sign) {
-	bool const found = gotoString(sign);  //< find the next string to the current position
-	empty(&highlights);             //< remove previous highlights
-	if (found) {                          //< apply new highlights if found
-		//if (sign == -1) { moveLetter(-1); }
-		highlightStringOnScreen(sign);
-	} else {                              //< go to the position where the search started.
-		applyPosition(&stateNormalMode.motion.searchPosition);
-	}
-	tsetdirt(0, term.row-3);              //< repaint everything except for the status bar, which
-	                                      //  is painted separately.
-}
-
-void pressKeys(char const* nullTerminatedString) {
-	size_t end;
-	for (size_t i = 0, end=strlen(nullTerminatedString); i < end; ++i) {
-		if (nullTerminatedString[i] == '\n') {
-			kpressNormalMode(&nullTerminatedString[i], 0, false, true, false);
-		} else {
-			kpressNormalMode(&nullTerminatedString[i], 1, false, false, false);
-		}
-	}
-}
-
-void executeCommand(DynamicArray const *command) {
-	size_t end;
-	char decoded [32];
-	for (size_t i = 0, end=size(command); i < end; ++i) {
-		size_t len = utf8encode(*((Rune*)view(command, i)) , decoded);
-		kpressNormalMode(decoded, len, false, false, false);
-	}
-	//kpressNormalMode(NULL, 0, false, true, false);
-}
-
-void kpressNormalMode(char const * ksym, uint32_t len, bool esc, bool enter, bool backspace) {
-	// [ESC] or [ENTER] abort resp. finish the current operation or
-	// the Normal Mode if no operation is currently executed.
-	if (esc || enter) {
-		if (stateNormalMode.command.op == noop
-				&& stateNormalMode.motion.search == none
-				&& stateNormalMode.motion.amount == 0) {
-			terminateCommand(!enter);
-			empty(&highlights);
-			tfulldirt(); // < this also removes the search string and the last command.
-			normalMode(NULL);
-		} else {
-			if (enter && stateNormalMode.motion.search != none && !isEmpty(&searchString)) {
-				exitCommand(); //stateNormalMode.motion.finished = true;
-				return;
-			} else {
-				abortCommand();
-			}
-		}
-		return;
-	} //< ! (esc || enter)
-	// Search: append to search string & conduct search for best hit, starting at start pos,
-	//         highlighting all other occurrences on the current page if one is found.
-	if (stateNormalMode.motion.search != none && !stateNormalMode.motion.finished) {
-		int8_t const sign = stateNormalMode.motion.search == forward ? 1 : -1;
-		// Apply start position.
-		if (backspace) { // XXX: if a quantifier is subject to removal, it is currently only removed
-			               //      from the  command string.
-			if (!isEmpty(currentCommand) && !isEmpty(&searchString)) {
-				pop(currentCommand);
-				pop(&searchString);
-			} else if (isEmpty(currentCommand) || isEmpty(&searchString)) {
-				empty(&highlights);
-				stateNormalMode.motion = defaultNormalMode .motion; //< if typed once more than there are
-				selclear();                                         //  letters, the search motion is
-				return;                                             //  terminated
-			}
-			applyPosition(&stateNormalMode.motion.searchPosition);
-		} else {
-			if (len > 0) {
-				char* kSearch = checkGetNext(&searchString);
-				utf8decode(ksym, (Rune*)(kSearch), len);
-
-				char* kCommand = checkGetNext(currentCommand);
-				utf8decode(ksym, (Rune*)(kCommand), len);
-			}
-		}
-		if (sign == -1) { moveLetter(1); }
-		gotoStringAndHighlight(sign); //< go to the next occurrence of the string and highlight
-		                              //  all occurrences currently on screen
-
-		if (stateNormalMode.command.op == visual) {
-			selextend(term.c.x, term.c.y, term.scr, sel.type, 0);
-		} else if  (stateNormalMode.command.op == visualLine) {
-			selextend(term.col-1, term.c.y, term.scr, sel.type, 0);
-		}
-		printCommandString();
-		printSearchString();
-		return;
-	}
-
-	if (len == 0) { return; }
-	// V / v or y take precedence over movement commands.
-	switch(ksym[0]) {
-		case '.':
-			{
-
-				if (!isEmpty(currentCommand)) { toggle = !toggle; empty(currentCommand); }
-				executeCommand(lastCommand);
-			}
-			return;
-		case 'y': //< Yank mode
-			{
-				char* kCommand = checkGetNext(currentCommand);
-				utf8decode(ksym, (Rune*)(kCommand), len);
-				switch(stateNormalMode.command.op) {
-					case noop:           //< Start yank mode & set #op
-						enableMode(yank);
-						selstart(term.c.x, term.c.y, term.scr, 0);
-						empty(currentCommand);
-						break;
-					case visualLine:     //< Complete yank operation
-					case visual:
-						xsetsel(getsel());     //< yank
-						xclipcopy();
-						exitCommand();         //< reset command
-						break;
-					case yank:           //< Complete yank operation as in y#amount j
-						selstart(0, term.c.y, term.scr, 0);
-						uint32_t const origY = term.c.y;
-						for (int32_t i = 0; i < MAX(stateNormalMode.motion.amount, 1) - 1; i ++) moveLine(1);
-						selextend(term.col-1, term.c.y, term.scr, SEL_RECTANGULAR, 0);
-						xsetsel(getsel());
-						xclipcopy();
-						term.c.y = origY;
-						exitCommand();
-				}
-			}
-			printCommandString();
-			printSearchString();
-			return;
-		case 'v':                //< Visual Mode: Toggle mode.
-		case 'V':
-			{
-				enum Operation mode = ksym[0] == 'v' ? visual : visualLine;
-				bool assign = stateNormalMode.command.op != mode;
-				abortCommand();
-				if (assign) {
-					enableMode(mode);
-					char* kCommand = checkGetNext(currentCommand);
-					utf8decode(ksym, (Rune*)(kCommand), len);
-					if (mode == visualLine) {
-						selstart(0, term.c.y, term.scr, 0);
-						selextend(term.col-1, term.c.y, term.scr, SEL_RECTANGULAR, 0);
-					} else {
-						selstart(term.c.x, term.c.y, term.scr, 0);
-					}
-				}
-			}
-			return;
-	}
-	// Perform the movement.
-	int32_t sign = -1;    //< whehter a command goes 'forward' (1) or 'backward' (-1)
-	bool discard = false; //< discard input, as it does not have a meaning.
-	switch(ksym[0]) {
-		case 'e': sign = 1;
-		case 'u':
-							term.c.y += sign * MAX(stateNormalMode.motion.amount, 1);
-							break;
-		case 'H': term.c.y = 0;            break; //< [numer]H ~ L[number]j is not supported.
-		case 'M': term.c.y = term.bot / 2; break;
-		case 'L': term.c.y = term.bot;     break; //< [numer]L ~ L[number]k is not supported.
-		case 'G':  //< a little different from vim, but in this use case the most useful translation.
-							applyPosition(&stateNormalMode.initialPosition);
-		case 'i': sign = 1;
-		case 'n':
-							{
-								int32_t const amount = term.c.x + sign * MAX(stateNormalMode.motion.amount, 1);
-								term.c.x = amount % term.col;
-								while (term.c.x < 0) { term.c.x += term.col; }
-								term.c.y += floor(1.0 * amount / term.col);
-								break;
-							}
-		case 'N':
-							if (stateNormalMode.motion.amount == 0) { term.c.x = 0; }
-							else { discard = true; }
-							break;
-		case 'I': term.c.x = term.col-1; break;
-		case 'w':
-		case 'W':
-		case 'h':
-		case 'E': sign = 1;
-		case 'B':
-		case 'b':
-							{
-								bool const startSpaceIsSeparator = !(ksym[0] == 'w' || ksym[0] == 'W');
-								bool const capital = ksym[0] <= 90; //< defines the word separators to use
-								char const * const wDelim = capital ? wordDelimLarge : wordDelimSmall;
-								uint32_t const wDelimLen =  strlen(wDelim);
-								bool const performOffset = startSpaceIsSeparator; //< start & end with offset.
-								uint32_t const maxIteration = (HISTSIZE + term.row) * term.col;  //< one complete traversal.
-
-								// doesn't work exactly as in vim, but I think this version is better;
-								// Linebreak is counted as 'normal' separator; hence a jump can span multiple lines here.
-								stateNormalMode.motion.amount = MAX(stateNormalMode.motion.amount, 1);
-								for (; stateNormalMode.motion.amount > 0; stateNormalMode.motion.amount--) {
-									uint8_t state = 0;
-									if (performOffset) { moveLetter(sign); }
-									for (uint32_t cIteration = 0; cIteration ++ < maxIteration; moveLetter(sign)) {
-										if (startSpaceIsSeparator == contains(TLINE(term.c.y)[term.c.x].u, wDelim, wDelimLen)) {
-											if (state == 1) {
-												if (performOffset) { moveLetter(-sign); }
-												break;
-											}
-										} else if (state == 0) { state = 1; }
-									}
-								}
-								break;
-							}
-		case '/': sign = 1;
-		case '?':
-							empty(&searchString);
-							stateNormalMode.motion.search = sign == 1 ? forward : backward;
-							stateNormalMode.motion.searchPosition.x = term.c.x;
-							stateNormalMode.motion.searchPosition.y = term.c.y;
-							stateNormalMode.motion.searchPosition.yScr = term.scr;
-							stateNormalMode.motion.finished = false;
-							break;
-		case '-': sign = 1;
-		case '=':
-							toggle = !toggle;
-							empty(currentCommand);
-							if (stateNormalMode.motion.search == none) {
-								stateNormalMode.motion.search = forward;
-								stateNormalMode.motion.finished = true;
-							}
-							for (int32_t amount = MAX(stateNormalMode.motion.amount, 1); amount > 0; amount--) {
-								if (stateNormalMode.motion.search == backward) { sign *= -1; }
-								moveLetter(sign);
-								gotoStringAndHighlight(sign);
-							}
-							break;
-		case 't':
-							if (sel.type == SEL_REGULAR) {
-								sel.type = SEL_RECTANGULAR;
-							} else {
-								sel.type = SEL_REGULAR;
-							}
-							tsetdirt(sel.nb.y, sel.ne.y);
-							discard = true;
-		default:
-							discard = true;
-	}
-	bool const isNumber = len == 1 && BETWEEN(ksym[0], 48, 57);
-	if (isNumber) { //< record numbers
-		discard = false;
-		stateNormalMode.motion.amount =
-			MIN(SHRT_MAX, stateNormalMode.motion.amount * 10 + ksym[0] - 48);
-	} else if (!discard) {
-		stateNormalMode.motion.amount = 0;
-	}
-
-	if (discard) {
-		for (size_t i = 0; i < amountNormalModeShortcuts; ++i) {
-			if (ksym[0] == normalModeShortcuts[i].key) {
-				pressKeys(normalModeShortcuts[i].value);
-			}
-		}
-	} else {
-		char* kCommand = checkGetNext(currentCommand);
-		utf8decode(ksym, (Rune*)(kCommand), len);
-
-		int diff = 0;
-		if (term.c.y > 0) {
-			if (term.c.y > term.bot) {
-				diff = term.bot - term.c.y;
-				term.c.y = term.bot;
-			}
-		} else {
-			if (term.c.y < 0) {
-				diff = -term.c.y;
-				term.c.y = 0;
-			}
-		}
-
-		int const _newScr = term.scr + diff;
-		term.c.y = _newScr < 0 ? 0 : (_newScr >= HISTSIZE ? term.bot : term.c.y);
-		term.scr = mod(_newScr, HISTSIZE);
-
-		if (!isEmpty(&highlights)) {
-			empty(&highlights);
-			highlightStringOnScreen();
-		}
-
-		tsetdirt(0, term.row-3);
-		printCommandString();
-		printSearchString();
-
-		if (stateNormalMode.command.op == visual) {
-			selextend(term.c.x, term.c.y, term.scr, sel.type, 0);
-		} else if  (stateNormalMode.command.op == visualLine) {
-			selextend(term.col-1, term.c.y, term.scr, sel.type, 0);
-		} else {
-			if (!isNumber && (stateNormalMode.motion.search == none
-					|| stateNormalMode.motion.finished)) {
-				toggle = !toggle;
-				empty(currentCommand);
-			}
-			if (stateNormalMode.command.op == yank) {
-				if (!isNumber && !discard) {
-					// copy
-					selextend(term.c.x, term.c.y, term.scr, sel.mode, 0);
-					xsetsel(getsel());
-					xclipcopy();
-					applyPosition(&stateNormalMode.command.startPosition);
-					exitCommand();
-				}
-			}
-		}
-	}
 }
 
 void
@@ -1857,10 +1185,6 @@ tmoveto(int x, int y)
 	term.c.state &= ~CURSOR_WRAPNEXT;
 	term.c.x = LIMIT(x, 0, term.col-1);
 	term.c.y = LIMIT(y, miny, maxy);
-	// Set the last position in order to restore after normal mode exits.
-	stateNormalMode.initialPosition.x = term.c.x;
-	stateNormalMode.initialPosition.y = term.c.y;
-	stateNormalMode.initialPosition.yScr = term.scr;
 }
 
 void
@@ -1967,14 +1291,14 @@ void
 tinsertblankline(int n)
 {
 	if (BETWEEN(term.c.y, term.top, term.bot))
-		tscrolldown(term.c.y, n, 0);
+		tscrolldown(term.c.y, n);
 }
 
 void
 tdeleteline(int n)
 {
 	if (BETWEEN(term.c.y, term.top, term.bot))
-		tscrollup(term.c.y, n, 0);
+		tscrollup(term.c.y, n);
 }
 
 int32_t
@@ -2324,6 +1648,12 @@ csihandle(void)
 		if (csiescseq.arg[0] == 0)
 			ttywrite(vtiden, strlen(vtiden), 0);
 		break;
+	case 'b': /* REP -- if last char is printable print it <n> more times */
+		DEFAULT(csiescseq.arg[0], 1);
+		if (term.lastc)
+			while (csiescseq.arg[0]-- > 0)
+				tputc(term.lastc);
+		break;
 	case 'C': /* CUF -- Cursor <n> Forward */
 	case 'a': /* HPR -- Cursor <n> Forward */
 		DEFAULT(csiescseq.arg[0], 1);
@@ -2405,11 +1735,11 @@ csihandle(void)
 		break;
 	case 'S': /* SU -- Scroll <n> line up */
 		DEFAULT(csiescseq.arg[0], 1);
-		tscrollup(term.top, csiescseq.arg[0], 0);
+		tscrollup(term.top, csiescseq.arg[0]);
 		break;
 	case 'T': /* SD -- Scroll <n> line down */
 		DEFAULT(csiescseq.arg[0], 1);
-		tscrolldown(term.top, csiescseq.arg[0], 0);
+		tscrolldown(term.top, csiescseq.arg[0]);
 		break;
 	case 'L': /* IL -- Insert <n> blank lines */
 		DEFAULT(csiescseq.arg[0], 1);
@@ -2447,7 +1777,7 @@ csihandle(void)
 		break;
 	case 'n': /* DSR – Device Status Report (cursor position) */
 		if (csiescseq.arg[0] == 6) {
-			len = snprintf(buf, sizeof(buf),"\033[%i;%iR",
+			len = snprintf(buf, sizeof(buf), "\033[%i;%iR",
 					term.c.y+1, term.c.x+1);
 			ttywrite(buf, len, 0);
 		}
@@ -2484,7 +1814,7 @@ csihandle(void)
 void
 csidump(void)
 {
-	int i;
+	size_t i;
 	uint c;
 
 	fprintf(stderr, "ESC[");
@@ -2531,7 +1861,7 @@ strhandle(void)
 				xsettitle(strescseq.args[1]);
 			return;
 		case 52:
-			if (narg > 2) {
+			if (narg > 2 && allowwindowops) {
 				dec = base64dec(strescseq.args[2]);
 				if (dec) {
 					xsetsel(dec);
@@ -2602,7 +1932,7 @@ strparse(void)
 void
 strdump(void)
 {
-	int i;
+	size_t i;
 	uint c;
 
 	fprintf(stderr, "ESC%c", strescseq.type);
@@ -2629,7 +1959,10 @@ strdump(void)
 void
 strreset(void)
 {
-	memset(&strescseq, 0, sizeof(strescseq));
+	strescseq = (STREscape){
+		.buf = xrealloc(strescseq.buf, STR_BUF_SIZ),
+		.siz = STR_BUF_SIZ,
+	};
 }
 
 void
@@ -2637,78 +1970,6 @@ sendbreak(const Arg *arg)
 {
 	if (tcsendbreak(cmdfd, 0))
 		perror("Error sending break");
-}
-
-// from @LukeSmithxyz
-int
-tlinehistlen(int y)
-{
-	int i = term.col;
-
-	if (TLINE_HIST(y)[i - 1].mode & ATTR_WRAP)
-		return i;
-
-	while (i > 0 && TLINE_HIST(y)[i - 1].u == ' ')
-		--i;
-
-	return i;
-}
-
-// from @LukeSmithxyz
-void
-externalpipe(const Arg *arg)
-{
-	int to[2];
-	char buf[UTF_SIZ];
-	void (*oldsigpipe)(int);
-	Glyph *bp, *end;
-	int lastpos, n, newline;
-
-	if (pipe(to) == -1)
-		return;
-
-	switch (fork()) {
-	case -1:
-		close(to[0]);
-		close(to[1]);
-		return;
-	case 0:
-		dup2(to[0], STDIN_FILENO);
-		close(to[0]);
-		close(to[1]);
-		execvp(((char **)arg->v)[0], (char **)arg->v);
-		fprintf(stderr, "st: execvp %s\n", ((char **)arg->v)[0]);
-		perror("failed");
-		exit(0);
-	}
-
-	close(to[0]);
-	/* ignore sigpipe for now, in case child exists early */
-	oldsigpipe = signal(SIGPIPE, SIG_IGN);
-	newline = 0;
-	/* modify externalpipe patch to pipe history too      */
-	for (n = 0; n <= HISTSIZE + 2; n++) {
-		bp = TLINE_HIST(n);
-		lastpos = MIN(tlinehistlen(n) +1, term.col) - 1;
-		if (lastpos < 0)
-			break;
-		if (lastpos == 0)
-			continue;
-		end = &bp[lastpos + 1];
-		for (; bp < end; ++bp)
-			if (xwrite(to[1], buf, utf8encode(bp->u, buf)) < 0)
-				break;
-		if ((newline = TLINE_HIST(n)[lastpos].mode & ATTR_WRAP))
-			continue;
-		if (xwrite(to[1], "\n", 1) < 0)
-			break;
-		newline = 0;
-	}
-	if (newline)
-		(void)xwrite(to[1], "\n", 1);
-	close(to[1]);
-	/* restore */
-	signal(SIGPIPE, oldsigpipe);
 }
 
 void
@@ -2759,7 +2020,7 @@ tdumpline(int n)
 	bp = &term.line[n][0];
 	end = &bp[MIN(tlinelen(n), term.col) - 1];
 	if (bp != end || bp->u != ' ') {
-		for ( ;bp <= end; ++bp)
+		for ( ; bp <= end; ++bp)
 			tprinter(buf, utf8encode(bp->u, buf));
 	}
 	tprinter("\n", 1);
@@ -2889,6 +2150,7 @@ tcontrolcode(uchar ascii)
 		return;
 	case '\032': /* SUB */
 		tsetchar('?', &term.c.attr, term.c.x, term.c.y);
+		/* FALLTHROUGH */
 	case '\030': /* CAN */
 		csireset();
 		break;
@@ -2984,7 +2246,7 @@ eschandle(uchar ascii)
 		return 0;
 	case 'D': /* IND -- Linefeed */
 		if (term.c.y == term.bot) {
-			tscrollup(term.top, 1, 1);
+			tscrollup(term.top, 1);
 		} else {
 			tmoveto(term.c.x, term.c.y+1);
 		}
@@ -2997,7 +2259,7 @@ eschandle(uchar ascii)
 		break;
 	case 'M': /* RI -- Reverse index */
 		if (term.c.y == term.top) {
-			tscrolldown(term.top, 1, 1);
+			tscrolldown(term.top, 1);
 		} else {
 			tmoveto(term.c.x, term.c.y-1);
 		}
@@ -3043,15 +2305,13 @@ tputc(Rune u)
 	Glyph *gp;
 
 	control = ISCONTROL(u);
-	if (!IS_SET(MODE_UTF8) && !IS_SET(MODE_SIXEL)) {
+	if (u < 127 || !IS_SET(MODE_UTF8 | MODE_SIXEL)) {
 		c[0] = u;
 		width = len = 1;
 	} else {
 		len = utf8encode(u, c);
-		if (!control && (width = wcwidth(u)) == -1) {
-			memcpy(c, "\357\277\275", 4); /* UTF_INVALID */
+		if (!control && (width = wcwidth(u)) == -1)
 			width = 1;
-		}
 	}
 
 	if (IS_SET(MODE_PRINT))
@@ -3083,7 +2343,7 @@ tputc(Rune u)
 		if (term.esc&ESC_DCS && strescseq.len == 0 && u == 'q')
 			term.mode |= MODE_SIXEL;
 
-		if (strescseq.len+len >= sizeof(strescseq.buf)-1) {
+		if (strescseq.len+len >= strescseq.siz) {
 			/*
 			 * Here is a bug in terminals. If the user never sends
 			 * some code to stop the str or esc command, then st
@@ -3097,7 +2357,10 @@ tputc(Rune u)
 			 * term.esc = 0;
 			 * strhandle();
 			 */
-			return;
+			if (strescseq.siz > (SIZE_MAX - UTF_SIZ) / 2)
+				return;
+			strescseq.siz *= 2;
+			strescseq.buf = xrealloc(strescseq.buf, strescseq.siz);
 		}
 
 		memmove(&strescseq.buf[strescseq.len], c, len);
@@ -3116,6 +2379,8 @@ check_control_code:
 		/*
 		 * control codes are not shown ever
 		 */
+		if (!term.esc)
+			term.lastc = 0;
 		return;
 	} else if (term.esc & ESC_START) {
 		if (term.esc & ESC_CSI) {
@@ -3146,7 +2411,7 @@ check_control_code:
 		 */
 		return;
 	}
-	if (sel.ob.x != -1 && BETWEEN(term.c.y, sel.ob.y, sel.oe.y))
+	if (selected(term.c.x, term.c.y))
 		selclear();
 
 	gp = &term.line[term.c.y][term.c.x];
@@ -3165,6 +2430,7 @@ check_control_code:
 	}
 
 	tsetchar(u, &term.c.attr, term.c.x, term.c.y);
+	term.lastc = u;
 
 	if (width == 2) {
 		gp->mode |= ATTR_WIDE;
@@ -3215,7 +2481,7 @@ twrite(const char *buf, int buflen, int show_ctrl)
 void
 tresize(int col, int row)
 {
-	int i, j;
+	int i;
 	int minrow = MIN(row, term.row);
 	int mincol = MIN(col, term.col);
 	int *bp;
@@ -3251,22 +2517,6 @@ tresize(int col, int row)
 	term.alt  = xrealloc(term.alt,  row * sizeof(Line));
 	term.dirty = xrealloc(term.dirty, row * sizeof(*term.dirty));
 	term.tabs = xrealloc(term.tabs, col * sizeof(*term.tabs));
-
-	for (i = 0; i < HISTSIZE; i++) {
-		term.hist[i] = xrealloc(term.hist[i], col * sizeof(Glyph));
-		for (j = mincol; j < col; j++) {
-			term.hist[i][j] = term.c.attr;
-			term.hist[i][j].u = ' ';
-		}
-	}
-
-	for (i = 0; i < HISTSIZE; i++) {
-		term.hist[i] = xrealloc(term.hist[i], col * sizeof(Glyph));
-		for (j = mincol; j < col; j++) {
-			term.hist[i][j] = term.c.attr;
-			term.hist[i][j].u = ' ';
-		}
-	}
 
 	/* resize each row to new width, zero-pad if needed */
 	for (i = 0; i < minrow; i++) {
@@ -3320,19 +2570,20 @@ void
 drawregion(int x1, int y1, int x2, int y2)
 {
 	int y;
+
 	for (y = y1; y < y2; y++) {
 		if (!term.dirty[y])
 			continue;
 
 		term.dirty[y] = 0;
-		xdrawline(TLINE(y), x1, y, x2);
+		xdrawline(term.line[y], x1, y, x2);
 	}
 }
 
 void
 draw(void)
 {
-	int cx = term.c.x;
+	int cx = term.c.x, ocx = term.ocx, ocy = term.ocy;
 
 	if (!xstartdraw())
 		return;
@@ -3346,12 +2597,13 @@ draw(void)
 		cx--;
 
 	drawregion(0, 0, term.col, term.row);
-	if (term.scr == 0)
-		xdrawcursor(cx, term.c.y, TLINE(term.c.y)[cx],
-				term.ocx, term.ocy, TLINE(term.ocy)[term.ocx]);
-	term.ocx = cx, term.ocy = term.c.y;
+	xdrawcursor(cx, term.c.y, term.line[term.c.y][cx],
+			term.ocx, term.ocy, term.line[term.ocy][term.ocx]);
+	term.ocx = cx;
+	term.ocy = term.c.y;
 	xfinishdraw();
-	xximspot(term.ocx, term.ocy);
+	if (ocx != term.ocx || ocy != term.ocy)
+		xximspot(term.ocx, term.ocy);
 }
 
 void
@@ -3359,126 +2611,4 @@ redraw(void)
 {
 	tfulldirt();
 	draw();
-}
-
-void
-tsetcolor( int row, int start, int end, uint32_t fg, uint32_t bg )
-{
-	int i = start;
-	for( ; i < end; ++i )
-	{
-		term.line[row][i].fg = fg;
-		term.line[row][i].bg = bg;
-	}
-}
-
-char *
-findlastany(char *str, const char** find, size_t len)
-{
-	char* found = NULL;
-	int i = 0;
-	for(found = str + strlen(str) - 1; found >= str; --found) {
-		for(i = 0; i < len; i++) {
-			if(strncmp(found, find[i], strlen(find[i])) == 0) {
-				return found;
-			}
-		}
-	}
-
-	return NULL;
-}
-
-/*
-** Select and copy the previous url on screen (do nothing if there's no url).
-**
-** FIXME: doesn't handle urls that span multiple lines; will need to add support
-**        for multiline "getsel()" first
-*/
-void
-copyurl(const Arg *arg) {
-	/* () and [] can appear in urls, but excluding them here will reduce false
-	 * positives when figuring out where a given url ends.
-	 */
-	static char URLCHARS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-		"abcdefghijklmnopqrstuvwxyz"
-		"0123456789-._~:/?#@!$&'*+,;=%";
-
-	static const char* URLSTRINGS[] = {"http://", "https://"};
-
-	/* remove highlighting from previous selection if any */
-	if(sel.ob.x >= 0 && sel.oe.x >= 0)
-		tsetcolor(sel.nb.y, sel.ob.x, sel.oe.x + 1, defaultfg, defaultbg);
-
-	int i = 0,
-		row = 0, /* row of current URL */
-		col = 0, /* column of current URL start */
-		startrow = 0, /* row of last occurrence */
-		colend = 0, /* column of last occurrence */
-		passes = 0; /* how many rows have been scanned */
-
-	char *linestr = calloc(sizeof(char), term.col+1); /* assume ascii */
-	char *c = NULL,
-		 *match = NULL;
-
-	row = (sel.ob.x >= 0 && sel.nb.y > 0) ? sel.nb.y : term.bot;
-	LIMIT(row, term.top, term.bot);
-	startrow = row;
-
-	colend = (sel.ob.x >= 0 && sel.nb.y > 0) ? sel.nb.x : term.col;
-	LIMIT(colend, 0, term.col);
-
-	/*
- 	** Scan from (term.bot,term.col) to (0,0) and find
-	** next occurrance of a URL
-	*/
-	while(passes !=term.bot + 2) {
-		/* Read in each column of every row until
- 		** we hit previous occurrence of URL
-		*/
-		for (col = 0, i = 0; col < colend; ++col,++i) {
-			/* assume ascii */
-			if (term.line[row][col].u > 127)
-				continue;
-			linestr[i] = term.line[row][col].u;
-		}
-		linestr[term.col] = '\0';
-
-		if ((match = findlastany(linestr, URLSTRINGS,
-						sizeof(URLSTRINGS)/sizeof(URLSTRINGS[0]))))
-			break;
-
-		if (--row < term.top)
-			row = term.bot;
-
-		colend = term.col;
-		passes++;
-	};
-
-	if (match) {
-		/* must happen before trim */
-		selclear();
-		sel.ob.x = strlen(linestr) - strlen(match);
-
-		/* trim the rest of the line from the url match */
-		for (c = match; *c != '\0'; ++c)
-			if (!strchr(URLCHARS, *c)) {
-				*c = '\0';
-				break;
-			}
-
-		/* highlight selection by inverting terminal colors */
-		tsetcolor(row, sel.ob.x, sel.ob.x + strlen( match ), defaultbg, defaultfg);
-
-		/* select and copy */
-		sel.mode = 1;
-		sel.type = SEL_REGULAR;
-		sel.oe.x = sel.ob.x + strlen(match)-1;
-		sel.ob.y = sel.oe.y = row;
-		selnormalize();
-		tsetdirt(sel.nb.y, sel.ne.y);
-		xsetsel(getsel());
-		xclipcopy();
-	}
-
-	free(linestr);
 }
